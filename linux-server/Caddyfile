@@ -1,0 +1,32 @@
+# ==============================================================================
+# Caddyfile - Otomatik TLS 1.3 + HTTP/3 (QUIC) + Sınırsız Boyut + CORS
+# Kurulum: sudo apt install caddy && sudo nano /etc/caddy/Caddyfile
+# ==============================================================================
+
+files.alanadiniz.com {
+    # Sınırsız dosya yükleme boyutu (100 GB+ dosyalar için)
+    request_body {
+        max_size 0
+    }
+
+    # React Web Uygulamanızdan (Farklı Domain/Port) erişim için CORS Başlıkları
+    @cors_preflight method OPTIONS
+    handle @cors_preflight {
+        header Access-Control-Allow-Origin "*"
+        header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS"
+        header Access-Control-Allow-Headers "Authorization, X-Auth, Content-Type, Tus-Resumable, Upload-Length, Upload-Offset, Upload-Metadata, Upload-Checksum"
+        header Access-Control-Expose-Headers "Upload-Offset, Upload-Length, Location, Tus-Resumable"
+        header Access-Control-Max-Age "86400"
+        respond "" 204
+    }
+
+    header {
+        Access-Control-Allow-Origin "*"
+        Access-Control-Expose-Headers "Upload-Offset, Upload-Length, Location, Tus-Resumable"
+    }
+
+    # FileBrowser'a sıfır tamponlama (Zero-Buffering Stream) ile yönlendir
+    reverse_proxy 127.0.0.1:8080 {
+        flush_interval -1
+    }
+}

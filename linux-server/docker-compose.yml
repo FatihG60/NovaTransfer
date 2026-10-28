@@ -1,0 +1,19 @@
+services:
+  filebrowser:
+    image: filebrowser/filebrowser:s6
+    container_name: filebrowser-sha512
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    environment:
+      - PUID=0
+      - PGID=0
+      - TZ=Europe/Istanbul
+    volumes:
+      - /srv/transfers:/srv
+      - ./database:/database
+      - ./config:/config
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
