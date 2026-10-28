@@ -53,8 +53,8 @@ if [ ! -f "$FB_DB_PATH" ]; then
     --database "$FB_DB_PATH"
 fi
 
-echo "[5/7] Web UI üzerinden okunabilen Otomatik Audit Log (.audit.log) kancaları (Hooks) ekleniyor..."
-sudo filebrowser cmds add after_upload "sh -c 'echo \"\$(date -Iseconds) | UPLOAD | User: \$USERNAME | File: \$FILE\" >> ${FB_AUDIT_LOG}'" --database "$FB_DB_PATH" || true
+echo "[5/7] Web UI üzerinden okunabilen Otomatik Audit Log (.audit.log) ve Paralel Striped Birleştirme (Merge) kancaları ekleniyor..."
+sudo filebrowser cmds add after_upload "sh -c 'case \"\$FILE\" in *.merge) TARGET=\"\${FILE%.merge}\"; cat \"\${TARGET}.part_\"* > \"\$TARGET\" && rm -f \"\${TARGET}.part_\"* \"\$FILE\" && echo \"\$(date -Iseconds) | STRIPED_MERGE | User: \$USERNAME | File: \$TARGET\" >> ${FB_AUDIT_LOG} ;; *.part_*) ;; *) echo \"\$(date -Iseconds) | UPLOAD | User: \$USERNAME | File: \$FILE\" >> ${FB_AUDIT_LOG} ;; esac'" --database "$FB_DB_PATH" || true
 sudo filebrowser cmds add after_delete "sh -c 'echo \"\$(date -Iseconds) | DELETE | User: \$USERNAME | File: \$FILE\" >> ${FB_AUDIT_LOG}'" --database "$FB_DB_PATH" || true
 sudo filebrowser cmds add after_rename "sh -c 'echo \"\$(date -Iseconds) | RENAME | User: \$USERNAME | File: \$FILE\" >> ${FB_AUDIT_LOG}'" --database "$FB_DB_PATH" || true
 

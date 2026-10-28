@@ -88,7 +88,8 @@ export function App() {
   const [password, setPassword] = useState<string>('ChangeMe_StrongPass2026!');
   const [jwtToken, setJwtToken] = useState<string>('');
   const [targetFolder, setTargetFolder] = useState<string>('/transfers');
-  const [chunkSizeMb, setChunkSizeMb] = useState<number>(10);
+  const [chunkSizeSetting, setChunkSizeSetting] = useState<number | 'adaptive'>('adaptive');
+  const [uploadConcurrency, setUploadConcurrency] = useState<number>(1);
   const [downloadConcurrency, setDownloadConcurrency] = useState<number>(6);
   const [verifyFullFileAtEnd, setVerifyFullFileAtEnd] = useState<boolean>(true);
   const [simulationMode, setSimulationMode] = useState<boolean>(true);
@@ -273,7 +274,8 @@ export function App() {
         {
           serverUrl,
           jwtToken,
-          chunkSizeMb,
+          chunkSizeMb: chunkSizeSetting,
+          uploadConcurrency,
           verifyFullFileAtEnd,
           simulationMode,
           onProgress: (progressState) => {
@@ -327,7 +329,8 @@ export function App() {
       serverUrl,
       jwtToken,
       username,
-      chunkSizeMb,
+      chunkSizeSetting,
+      uploadConcurrency,
       verifyFullFileAtEnd,
       simulationMode,
       addLog,
@@ -368,7 +371,7 @@ export function App() {
         {
           serverUrl,
           jwtToken,
-          chunkSizeMb,
+          chunkSizeMb: typeof chunkSizeSetting === 'number' ? chunkSizeSetting : 10,
           concurrency: downloadConcurrency,
           simulationMode,
           expectedServerSha512: file.sha512,
@@ -387,7 +390,7 @@ export function App() {
       downloadersRef.current[dlId] = downloader;
       await downloader.startOrResume();
     },
-    [serverUrl, jwtToken, chunkSizeMb, downloadConcurrency, simulationMode, addLog]
+    [serverUrl, jwtToken, chunkSizeSetting, downloadConcurrency, simulationMode, addLog]
   );
 
   const handlePauseDownload = useCallback((dlId: string) => {
@@ -455,11 +458,11 @@ export function App() {
       });
       addLog(
         'info',
-        `${sizeMb} MB deterministik test dosyası oluşturuldu (${Math.ceil(sizeMb / chunkSizeMb)} × ${chunkSizeMb} MB parça).`
+        `${sizeMb} MB deterministik test dosyası oluşturuldu (Mod: ${uploadConcurrency}x Kanal, Parça: ${chunkSizeSetting === 'adaptive' ? 'Adaptif' : chunkSizeSetting + ' MB'}).`
       );
       await startFileTransfer(testFile);
     },
-    [chunkSizeMb, addLog, startFileTransfer]
+    [chunkSizeSetting, uploadConcurrency, addLog, startFileTransfer]
   );
 
   // Resume directly from IndexedDB persisted FileSystemFileHandle
@@ -751,7 +754,7 @@ export function App() {
             Dosyaları TUS + SHA-512 Kuyruğuna Bırakın
           </div>
           <div className="text-[12px] text-[#9499A6] mt-1 font-mono">
-            Hedef: {targetFolder} • {chunkSizeMb} MB Pipelined Parçalar
+            Hedef: {targetFolder} • {chunkSizeSetting === 'adaptive' ? 'Adaptif (10/32/64 MB)' : `${chunkSizeSetting} MB`} • {uploadConcurrency}x Upload Kanalı
           </div>
         </div>
       )}
@@ -1041,16 +1044,70 @@ export function App() {
             <>
               {/* Upper Data Table Section */}
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-                {/* Section Header Bar with Filter */}
-                <div className="h-[36px] shrink-0 px-4 border-b border-[#1E2230] flex items-center justify-between bg-[#0A0B0E]">
+                {/* Section Header Bar with Adaptive Chunk Size, Striped Upload Mode & Filter */}
+                <div className="h-[38px] shrink-0 px-4 border-b border-[#1E2230] flex items-center justify-between bg-[#0A0B0E]">
                   <div className="flex items-center gap-2 text-[12px] font-medium text-[#ECEEF2]">
-                    <span>TUS Parçalı Yükleme Kuyruğu (Upload)</span>
+                    <span>TUS Parçalı Yükleme Kuyruğu</span>
                     <span className="text-[11px] font-mono text-[#636875]">
                       ({targetFolder})
                     </span>
                   </div>
 
-                  <div className="flex items-center gap-2.5">
+                  <div className="flex items-center gap-3">
+                    {/* Adaptive Chunk Size Selector */}
+                    <div className="flex items-center gap-1 text-[11px] text-[#9499A6]">
+                      <span>Parça:</span>
+                      {(
+                        [
+                          { label: 'Adaptif', val: 'adaptive' },
+                          { label: '10M', val: 10 },
+                          { label: '32M', val: 32 },
+                          { label: '64M', val: 64 },
+                        ] as const
+                      ).map((opt) => (
+                        <button
+                          key={String(opt.val)}
+                          onClick={() => setChunkSizeSetting(opt.val)}
+                          className={`h-[22px] px-2 rounded font-mono text-[10px] border cursor-pointer ${
+                            chunkSizeSetting === opt.val
+                              ? 'bg-[#192338] border-[#3B82F6] text-[#ECEEF2]'
+                              : 'bg-[#161922] border-[#2A2F40] text-[#9499A6]'
+                          }`}
+                          title="Adaptif mod: <400MB için 10MB, 400MB-4GB için 32MB, >4GB için 64MB seçer"
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Single vs Striped Parallel Upload Concurrency Selector */}
+                    <div className="flex items-center gap-1 text-[11px] text-[#9499A6]">
+                      <span>Upload Kanalı:</span>
+                      {[
+                        { label: '1x (Sıfır-Merge)', val: 1 },
+                        { label: '4x Striped', val: 4 },
+                        { label: '6x Striped', val: 6 },
+                        { label: '8x Striped', val: 8 },
+                      ].map((opt) => (
+                        <button
+                          key={opt.val}
+                          onClick={() => setUploadConcurrency(opt.val)}
+                          className={`h-[22px] px-2 rounded font-mono text-[10px] border cursor-pointer ${
+                            uploadConcurrency === opt.val
+                              ? 'bg-[#192338] border-[#3B82F6] text-[#ECEEF2]'
+                              : 'bg-[#161922] border-[#2A2F40] text-[#9499A6]'
+                          }`}
+                          title={
+                            opt.val === 1
+                              ? 'Tek kanallı Pipelined TUS (Sunucuda birleştirme süresi 0 sn)'
+                              : `${opt.val} eşzamanlı TUS kanalı + yükleme sonunda sunucuda otomatik cat .part_* birleştirmesi`
+                          }
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+
                     <div className="relative flex items-center">
                       <Search
                         className="w-3.5 h-3.5 text-[#636875] absolute left-2 pointer-events-none"
@@ -1060,8 +1117,8 @@ export function App() {
                         type="text"
                         value={searchFilter}
                         onChange={(e) => setSearchFilter(e.target.value)}
-                        placeholder="Dosya veya parmak izi filtrele..."
-                        className="h-[24px] w-[210px] pl-7 pr-2 rounded bg-[#161922] border border-[#2A2F40] text-[11px] text-[#ECEEF2] placeholder-[#636875] focus:outline-none focus:border-[#3B82F6]"
+                        placeholder="Dosya veya parmak izi..."
+                        className="h-[24px] w-[170px] pl-7 pr-2 rounded bg-[#161922] border border-[#2A2F40] text-[11px] text-[#ECEEF2] placeholder-[#636875] focus:outline-none focus:border-[#3B82F6]"
                       />
                     </div>
                   </div>
@@ -1078,7 +1135,7 @@ export function App() {
                         Dosyaları bu pencereye sürükleyin veya aktarım başlatın
                       </p>
                       <p className="text-[12px] text-[#636875] mt-1 max-w-md">
-                        100 GB+ dosyalar yalnızca {chunkSizeMb} MB bellek dilimiyle parçalı (TUS) aktarılır; her parça <code className="text-[#9499A6]">Upload-Checksum: sha512</code> ile doğrulanır.
+                        100 GB+ dosyalar {chunkSizeSetting === 'adaptive' ? 'Adaptif (10/32/64 MB)' : `${chunkSizeSetting} MB`} bellek dilimiyle parçalı (TUS) aktarılır; her parça <code className="text-[#9499A6]">Upload-Checksum: sha512</code> ile doğrulanır.
                       </p>
                       <div className="mt-4 flex items-center gap-2">
                         <button
@@ -1201,7 +1258,17 @@ export function App() {
                                       className="w-3.5 h-3.5 animate-spin"
                                       strokeWidth={1.75}
                                     />
-                                    <span>Aktarılıyor</span>
+                                    <span>
+                                      {item.uploadConcurrency > 1
+                                        ? `Striped (${item.activeUploadWorkers}x)`
+                                        : 'Aktarılıyor'}
+                                    </span>
+                                  </span>
+                                )}
+                                {item.status === 'merging' && (
+                                  <span className="inline-flex items-center gap-1 text-[11px] text-amber-300 font-medium">
+                                    <Layers className="w-3.5 h-3.5 animate-pulse" strokeWidth={1.75} />
+                                    <span>Sunucuda Birleştiriliyor</span>
                                   </span>
                                 )}
                                 {item.status === 'paused' && (
@@ -1455,37 +1522,24 @@ export function App() {
                               </span>
                             </div>
                             <span className="font-mono text-[#9499A6] tabular-nums">
-                              {selectedTransfer.totalChunks} Parça × {chunkSizeMb} MB
+                              {selectedTransfer.totalChunks} Parça × {selectedTransfer.chunkSizeMb} MB ({selectedTransfer.uploadConcurrency}x Kanal)
                             </span>
                           </div>
 
                           <div className="grid grid-cols-24 gap-1.5 p-2.5 rounded bg-[#161922]/60 border border-[#1E2230] max-h-[135px] overflow-y-auto">
-                            {Array.from({
-                              length: Math.min(240, selectedTransfer.totalChunks),
-                            }).map((_, idx) => {
-                              const done = idx < selectedTransfer.currentChunkIndex;
-                              const active =
-                                idx === selectedTransfer.currentChunkIndex &&
-                                selectedTransfer.status === 'uploading';
-                              const pausedHere =
-                                idx === selectedTransfer.currentChunkIndex &&
-                                selectedTransfer.status === 'paused';
-                              const pipelined =
-                                idx === selectedTransfer.currentChunkIndex + 1 &&
-                                selectedTransfer.status === 'uploading';
-
+                            {selectedTransfer.chunkStates.slice(0, 240).map((st, idx) => {
                               return (
                                 <div
                                   key={idx}
-                                  title={`Parça #${idx + 1} (${idx * chunkSizeMb} MB – ${(idx + 1) * chunkSizeMb} MB)`}
+                                  title={`Parça #${idx + 1} (${idx * selectedTransfer.chunkSizeMb} MB – ${(idx + 1) * selectedTransfer.chunkSizeMb} MB) [${st}]`}
                                   className={`h-[22px] rounded-xs font-mono text-[10px] flex items-center justify-center tabular-nums transition-colors ${
-                                    done
+                                    st === 'completed'
                                       ? 'bg-emerald-500/20 border border-emerald-500/60 text-emerald-300'
-                                      : active
+                                      : st === 'uploading'
                                       ? 'bg-[#3B82F6] text-white font-semibold'
-                                      : pausedHere
+                                      : st === 'paused'
                                       ? 'bg-amber-500/30 border border-amber-500 text-amber-300'
-                                      : pipelined
+                                      : st === 'pipelined'
                                       ? 'bg-[#192338] border border-[#3B82F6]/60 text-[#9499A6]'
                                       : 'bg-[#161922] border border-[#1E2230] text-[#636875]'
                                   }`}
@@ -1866,7 +1920,7 @@ export function App() {
                               {selectedDownload.chunkStates.map((st, idx) => (
                                 <div
                                   key={idx}
-                                  title={`Range Parçası #${idx + 1}: bytes=${idx * chunkSizeMb}M-${(idx + 1) * chunkSizeMb}M (${st})`}
+                                  title={`Range Parçası #${idx + 1} (${st})`}
                                   className={`h-[24px] rounded-xs font-mono text-[10px] flex items-center justify-center tabular-nums transition-colors ${
                                     st === 'completed'
                                       ? 'bg-emerald-500/20 border border-emerald-500/60 text-emerald-300'
@@ -1992,13 +2046,19 @@ export function App() {
                     />
                   </div>
                   <div>
-                    <label className="block text-[#9499A6] mb-1">Parça Boyutu (MB)</label>
+                    <label className="block text-[#9499A6] mb-1">
+                      Striped Upload Kanalı (1-8)
+                    </label>
                     <input
                       type="number"
                       min={1}
-                      max={100}
-                      value={chunkSizeMb}
-                      onChange={(e) => setChunkSizeMb(Number(e.target.value) || 10)}
+                      max={8}
+                      value={uploadConcurrency}
+                      onChange={(e) =>
+                        setUploadConcurrency(
+                          Math.min(8, Math.max(1, Number(e.target.value) || 1))
+                        )
+                      }
                       className="w-full h-[32px] px-3 rounded bg-[#161922] border border-[#2A2F40] font-mono text-[#ECEEF2]"
                     />
                   </div>
