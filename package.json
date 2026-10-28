@@ -1,5 +1,5 @@
 {
-  "name": "filebrowser-sha512-transfer",
+  "name": "novatransfer",
   "version": "1.0.0",
   "description": "High-Speed Resumable TUS + Pipelined SHA-512 File Transfer Client for Linux FileBrowser",
   "type": "module",

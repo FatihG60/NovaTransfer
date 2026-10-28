@@ -1,4 +1,4 @@
-# FileBrowser TUS • Pipelined SHA-512 Transfer Console
+# NovaTransfer — FileBrowser TUS & Pipelined SHA-512 Transfer Console
 
 Windows (Web Client) ↔ Linux (FileBrowser Sunucusu) arasında **sınırsız dosya boyutunda**, **Duraklat / Devam Et (Pause & Resume)** destekli ve **sıfır gecikmeli (Pipelined) SHA-512 bütünlük doğrulamalı** dosya transfer sistemi.
 
