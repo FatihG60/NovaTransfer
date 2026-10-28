@@ -109,8 +109,8 @@ sudo systemctl enable --now filebrowser`,
     handle @cors_preflight {
         header Access-Control-Allow-Origin "*"
         header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS"
-        header Access-Control-Allow-Headers "Authorization, X-Auth, Content-Type, Tus-Resumable, Upload-Length, Upload-Offset, Upload-Metadata, Upload-Checksum"
-        header Access-Control-Expose-Headers "Upload-Offset, Upload-Length, Location, Tus-Resumable"
+        header Access-Control-Allow-Headers "Authorization, X-Auth, Content-Type, Range, Tus-Resumable, Upload-Length, Upload-Offset, Upload-Metadata, Upload-Checksum"
+        header Access-Control-Expose-Headers "Upload-Offset, Upload-Length, Location, Tus-Resumable, Content-Range, Accept-Ranges"
         header Access-Control-Max-Age "86400"
         respond "" 204
     }
@@ -150,8 +150,8 @@ sudo systemctl enable --now filebrowser`,
         if ($request_method = 'OPTIONS') {
             add_header 'Access-Control-Allow-Origin' '*' always;
             add_header 'Access-Control-Allow-Methods' 'GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS' always;
-            add_header 'Access-Control-Allow-Headers' 'Authorization, X-Auth, Content-Type, Tus-Resumable, Upload-Length, Upload-Offset, Upload-Metadata, Upload-Checksum' always;
-            add_header 'Access-Control-Expose-Headers' 'Upload-Offset, Upload-Length, Location, Tus-Resumable' always;
+            add_header 'Access-Control-Allow-Headers' 'Authorization, X-Auth, Content-Type, Range, Tus-Resumable, Upload-Length, Upload-Offset, Upload-Metadata, Upload-Checksum' always;
+            add_header 'Access-Control-Expose-Headers' 'Upload-Offset, Upload-Length, Location, Tus-Resumable, Content-Range, Accept-Ranges' always;
             return 204;
         }
 

@@ -36,6 +36,10 @@ import {
   clearAllPersistedSessions,
   computeFastFileFingerprint,
 } from './engine/ResumableSha512Engine';
+import {
+  ParallelRangeSha512Downloader,
+  DownloadProgress,
+} from './engine/ParallelRangeDownloader';
 import { LINUX_SERVER_GUIDES } from './data/linuxServerGuides';
 
 interface LogEntry {
@@ -85,18 +89,40 @@ export function App() {
   const [jwtToken, setJwtToken] = useState<string>('');
   const [targetFolder, setTargetFolder] = useState<string>('/transfers');
   const [chunkSizeMb, setChunkSizeMb] = useState<number>(10);
+  const [downloadConcurrency, setDownloadConcurrency] = useState<number>(6);
   const [verifyFullFileAtEnd, setVerifyFullFileAtEnd] = useState<boolean>(true);
   const [simulationMode, setSimulationMode] = useState<boolean>(true);
 
-  // Transfer State
+  // Upload & Download State
   const [transfers, setTransfers] = useState<Record<string, TransferProgress>>({});
   const [selectedFingerprint, setSelectedFingerprint] = useState<string | null>(null);
+  const [downloads, setDownloads] = useState<Record<string, DownloadProgress>>({});
+  const [selectedDownloadId, setSelectedDownloadId] = useState<string | null>(null);
+
   const [persistedSessions, setPersistedSessions] = useState<Record<string, PersistedSession>>({});
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [auditLines, setAuditLines] = useState<string[]>([
     '2026-10-28T21:40:00+03:00 | SYSTEM | FileBrowser Audit Hook (.audit.log) hazır — GET /api/raw/.audit.log',
   ]);
   const [remoteFiles, setRemoteFiles] = useState<RemoteServerFile[]>([
+    {
+      name: 'ubuntu-24.04.1-live-server-amd64.iso',
+      path: '/transfers/ubuntu-24.04.1-live-server-amd64.iso',
+      size: 180 * 1024 * 1024, // 180 MB (18 chunks of 10 MB)
+      modified: '2026-10-28 21:15:00',
+      isDir: false,
+      sha512:
+        '8a4c9e52d0a1f71e63b4b9c85e2a10d97b3f4c81e2d5a609b7c8e1f2a3d4b5c60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0123456789abc',
+    },
+    {
+      name: 'postgres_prod_cluster_dump.tar.zst',
+      path: '/transfers/postgres_prod_cluster_dump.tar.zst',
+      size: 140 * 1024 * 1024, // 140 MB (14 chunks of 10 MB)
+      modified: '2026-10-28 21:30:00',
+      isDir: false,
+      sha512:
+        '4f2b1c90e8d7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9',
+    },
     {
       name: '.audit.log',
       path: '/transfers/.audit.log',
@@ -116,6 +142,7 @@ export function App() {
   const [searchFilter, setSearchFilter] = useState<string>('');
 
   const uploadersRef = useRef<Record<string, ResumableSha512Uploader>>({});
+  const downloadersRef = useRef<Record<string, ParallelRangeSha512Downloader>>({});
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const addLog = useCallback((level: LogEntry['level'], message: string) => {
@@ -200,7 +227,7 @@ export function App() {
     refreshPersistedSessions();
     addLog(
       'info',
-      'Pipelined TUS + SHA-512 (WebAssembly 64-bit) aktarım motoru hazır. Parça boyutu: 10 MB.'
+      'Pipelined TUS (Upload) + Çok Kanallı HTTP 206 Range (Download) + SHA-512 motoru hazır.'
     );
   }, [refreshPersistedSessions, addLog]);
 
@@ -307,6 +334,80 @@ export function App() {
       refreshPersistedSessions,
     ]
   );
+
+  // Start a Multi-Stream Parallel HTTP 206 Range Download with SHA-512 verification
+  const startParallelRangeDownload = useCallback(
+    async (file: RemoteServerFile, useSavePicker = false) => {
+      let saveHandle: FileSystemFileHandle | undefined;
+
+      if (useSavePicker && 'showSaveFilePicker' in window) {
+        try {
+          saveHandle = await (
+            window as unknown as {
+              showSaveFilePicker: (opts: { suggestedName: string }) => Promise<FileSystemFileHandle>;
+            }
+          ).showSaveFilePicker({ suggestedName: file.name });
+        } catch (err) {
+          if (err instanceof DOMException && err.name === 'AbortError') return;
+        }
+      }
+
+      const dlId = `dl_${file.path}_${file.size}`;
+      setSelectedDownloadId(dlId);
+
+      const existing = downloadersRef.current[dlId];
+      if (existing) {
+        await existing.startOrResume();
+        return;
+      }
+
+      const downloader = new ParallelRangeSha512Downloader(
+        file.name,
+        file.path,
+        file.size,
+        {
+          serverUrl,
+          jwtToken,
+          chunkSizeMb,
+          concurrency: downloadConcurrency,
+          simulationMode,
+          expectedServerSha512: file.sha512,
+          onProgress: (dlState) => {
+            setDownloads((prev) => ({
+              ...prev,
+              [dlState.id]: dlState,
+            }));
+            setSelectedDownloadId((curr) => curr || dlState.id);
+          },
+          onLog: addLog,
+        },
+        saveHandle
+      );
+
+      downloadersRef.current[dlId] = downloader;
+      await downloader.startOrResume();
+    },
+    [serverUrl, jwtToken, chunkSizeMb, downloadConcurrency, simulationMode, addLog]
+  );
+
+  const handlePauseDownload = useCallback((dlId: string) => {
+    downloadersRef.current[dlId]?.pause();
+  }, []);
+
+  const handleResumeDownload = useCallback(async (dlId: string) => {
+    await downloadersRef.current[dlId]?.startOrResume();
+  }, []);
+
+  const handleRemoveDownload = useCallback((dlId: string) => {
+    downloadersRef.current[dlId]?.pause();
+    delete downloadersRef.current[dlId];
+    setDownloads((prev) => {
+      const next = { ...prev };
+      delete next[dlId];
+      return next;
+    });
+    setSelectedDownloadId((curr) => (curr === dlId ? null : curr));
+  }, []);
 
   // Pick file with File System Access API
   const handleModernFilePicker = useCallback(async () => {
@@ -488,15 +589,29 @@ export function App() {
   );
   const selectedTransfer =
     (selectedFingerprint && transfers[selectedFingerprint]) || transferList[0] || null;
+
+  const downloadList = Object.values(downloads);
+  const selectedDownload =
+    (selectedDownloadId && downloads[selectedDownloadId]) || downloadList[0] || null;
+
   const persistedList = Object.values(persistedSessions);
 
-  // Total live aggregate speed
-  const totalSpeedBytesPerSec = Object.values(transfers).reduce(
+  // Total live aggregate speed (Uploads + Parallel Range Downloads)
+  const totalUploadSpeed = Object.values(transfers).reduce(
     (acc, t) => acc + (t.status === 'uploading' ? t.speedBytesPerSec : 0),
     0
   );
+  const totalDownloadSpeed = Object.values(downloads).reduce(
+    (acc, d) => acc + (d.status === 'downloading' ? d.speedBytesPerSec : 0),
+    0
+  );
+  const totalSpeedBytesPerSec = totalUploadSpeed + totalDownloadSpeed;
+
   const activeUploadsCount = Object.values(transfers).filter(
     (t) => t.status === 'uploading'
+  ).length;
+  const activeDownloadsCount = Object.values(downloads).filter(
+    (d) => d.status === 'downloading'
   ).length;
 
   // Global Keyboard Shortcuts (Ctrl+K Command Palette, Space to Pause/Resume)
@@ -515,18 +630,36 @@ export function App() {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
 
-      if (e.code === 'Space' && selectedTransfer) {
-        e.preventDefault();
-        if (selectedTransfer.status === 'uploading') {
-          handlePause(selectedTransfer.fingerprint);
-        } else if (selectedTransfer.status === 'paused') {
-          handleResumeActive(selectedTransfer.fingerprint);
+      if (e.code === 'Space') {
+        if (activeNav === 'transfers' && selectedTransfer) {
+          e.preventDefault();
+          if (selectedTransfer.status === 'uploading') {
+            handlePause(selectedTransfer.fingerprint);
+          } else if (selectedTransfer.status === 'paused') {
+            handleResumeActive(selectedTransfer.fingerprint);
+          }
+        } else if (activeNav === 'remote-files' && selectedDownload) {
+          e.preventDefault();
+          if (selectedDownload.status === 'downloading') {
+            handlePauseDownload(selectedDownload.id);
+          } else if (selectedDownload.status === 'paused') {
+            handleResumeDownload(selectedDownload.id);
+          }
         }
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isCmdPaletteOpen, selectedTransfer, handlePause, handleResumeActive]);
+  }, [
+    isCmdPaletteOpen,
+    activeNav,
+    selectedTransfer,
+    selectedDownload,
+    handlePause,
+    handleResumeActive,
+    handlePauseDownload,
+    handleResumeDownload,
+  ]);
 
   const commandActions = [
     {
@@ -537,15 +670,20 @@ export function App() {
     },
     {
       id: 'test-120mb',
-      label: '120 MB Deterministik Test Dosyası Aktarımını Başlat (12 × 10 MB Parça)',
-      shortcut: 'Test 120M',
+      label: '120 MB Deterministik Test Yüklemesi Başlat (12 × 10 MB Parça)',
+      shortcut: 'Upload 120M',
       run: () => handleGenerateTestFile(120),
     },
     {
-      id: 'test-250mb',
-      label: '250 MB Büyük Test Dosyası Aktarımını Başlat (25 × 10 MB Parça)',
-      shortcut: 'Test 250M',
-      run: () => handleGenerateTestFile(250),
+      id: 'test-parallel-dl',
+      label: `180 MB Ubuntu ISO Paralel Range İndirmesi Başlat (${downloadConcurrency}x Kanal + SHA-512)`,
+      shortcut: `Range ${downloadConcurrency}x`,
+      run: () => {
+        setActiveNav('remote-files');
+        if (remoteFiles[0]) {
+          startParallelRangeDownload(remoteFiles[0], false);
+        }
+      },
     },
     {
       id: 'view-chunk-map',
@@ -568,7 +706,7 @@ export function App() {
     },
     {
       id: 'view-remote',
-      label: 'Linux Sunucu Dosya Gezginini Aç (/srv/transfers)',
+      label: 'Linux Sunucu Dosya Gezginini ve Paralel İndiriciyi Aç',
       shortcut: 'Explorer',
       run: () => {
         setActiveNav('remote-files');
@@ -626,7 +764,7 @@ export function App() {
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="w-[540px] rounded bg-[#0F1117] border border-[#2A2F40] shadow-2xl overflow-hidden"
+            className="w-[560px] rounded bg-[#0F1117] border border-[#2A2F40] shadow-2xl overflow-hidden"
           >
             <div className="h-[40px] px-3 border-b border-[#1E2230] flex items-center gap-2.5">
               <Search className="w-4 h-4 text-[#636875]" strokeWidth={1.5} />
@@ -676,7 +814,7 @@ export function App() {
             <ShieldCheck className="w-3.5 h-3.5 text-[#3B82F6]" strokeWidth={1.75} />
           </div>
           <span className="text-[12px] font-semibold tracking-tight text-[#ECEEF2]">
-            FileBrowser TUS • SHA-512 Transfer Console
+            NovaTransfer • TUS & Parallel Range SHA-512 Console
           </span>
           <span className="text-[11px] text-[#636875] font-mono">
             {simulationMode ? '[Simülasyon]' : `[${serverUrl}]`}
@@ -710,7 +848,7 @@ export function App() {
             className="h-[26px] px-2.5 rounded text-[11px] font-medium bg-[#161922] hover:bg-[#1C202B] text-[#ECEEF2] border border-[#2A2F40] flex items-center gap-1.5 transition-colors cursor-pointer"
           >
             <Cpu className="w-3.5 h-3.5 text-[#9499A6]" strokeWidth={1.5} />
-            <span>120 MB Test Aktar</span>
+            <span>120 MB Test Yükle</span>
           </button>
 
           <button
@@ -750,7 +888,7 @@ export function App() {
                 >
                   <span className="flex items-center gap-2">
                     <HardDrive className="w-3.5 h-3.5" strokeWidth={1.5} />
-                    <span>Aktarımlar (TUS)</span>
+                    <span>Yüklemeler (TUS Upload)</span>
                   </span>
                   <span className="text-[11px] font-mono text-[#636875] tabular-nums">
                     {Object.keys(transfers).length}
@@ -769,11 +907,11 @@ export function App() {
                   }`}
                 >
                   <span className="flex items-center gap-2">
-                    <FolderOpen className="w-3.5 h-3.5" strokeWidth={1.5} />
-                    <span>Sunucu Dosya Gezgini</span>
+                    <Download className="w-3.5 h-3.5" strokeWidth={1.5} />
+                    <span>Sunucu & Paralel İndir</span>
                   </span>
-                  <span className="text-[11px] font-mono text-[#636875] tabular-nums">
-                    {remoteFiles.length}
+                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#161922] border border-[#2A2F40] text-[#3B82F6]">
+                    {downloadConcurrency}x Range
                   </span>
                 </button>
 
@@ -804,7 +942,7 @@ export function App() {
                 >
                   <span className="flex items-center gap-2">
                     <Sliders className="w-3.5 h-3.5" strokeWidth={1.5} />
-                    <span>Protokol & Sunucu Ayarı</span>
+                    <span>Protokol & Kanal Ayarı</span>
                   </span>
                 </button>
               </nav>
@@ -884,8 +1022,8 @@ export function App() {
             </div>
             <div className="grid grid-cols-2 gap-1.5 pt-1 border-t border-[#1E2230] text-[10px] font-mono">
               <div>
-                <div className="text-[#636875]">RAM Dilimi</div>
-                <div className="text-[#ECEEF2] tabular-nums">{chunkSizeMb}.0 MB Sabit</div>
+                <div className="text-[#636875]">Range Kanalı</div>
+                <div className="text-[#ECEEF2] tabular-nums">{downloadConcurrency}x Paralel</div>
               </div>
               <div>
                 <div className="text-[#636875]">Toplam Hız</div>
@@ -906,7 +1044,7 @@ export function App() {
                 {/* Section Header Bar with Filter */}
                 <div className="h-[36px] shrink-0 px-4 border-b border-[#1E2230] flex items-center justify-between bg-[#0A0B0E]">
                   <div className="flex items-center gap-2 text-[12px] font-medium text-[#ECEEF2]">
-                    <span>TUS Parçalı Aktarım Kuyruğu</span>
+                    <span>TUS Parçalı Yükleme Kuyruğu (Upload)</span>
                     <span className="text-[11px] font-mono text-[#636875]">
                       ({targetFolder})
                     </span>
@@ -955,7 +1093,7 @@ export function App() {
                           className="h-[30px] px-3.5 rounded text-[12px] font-medium bg-[#161922] hover:bg-[#1C202B] text-[#ECEEF2] border border-[#2A2F40] flex items-center gap-1.5 cursor-pointer"
                         >
                           <Cpu className="w-3.5 h-3.5 text-[#9499A6]" strokeWidth={1.5} />
-                          <span>120 MB Test Dosyası ile Dene</span>
+                          <span>120 MB Test Yüklemesi Başlat</span>
                         </button>
                       </div>
                     </div>
@@ -1131,7 +1269,6 @@ export function App() {
 
               {/* Bottom Inspector Pane (250px) */}
               <section className="h-[250px] shrink-0 bg-[#0F1117] border-t border-[#1E2230] flex flex-col">
-                {/* Horizontal Underline Tab Strip */}
                 <div className="h-[34px] px-4 border-b border-[#1E2230] flex items-center justify-between">
                   <div className="flex items-center gap-5 h-full">
                     <button
@@ -1173,7 +1310,7 @@ export function App() {
                       }`}
                     >
                       <Terminal className="w-3.5 h-3.5" strokeWidth={1.5} />
-                      <span>TUS Protokol Günlüğü ({logs.length})</span>
+                      <span>Protokol Günlüğü ({logs.length})</span>
                     </button>
 
                     <button
@@ -1290,7 +1427,6 @@ export function App() {
                     </div>
                   )}
 
-                  {/* Live Visual Chunk Integrity Matrix */}
                   {inspectorTab === 'chunk-map' && (
                     <div className="space-y-2.5">
                       {!selectedTransfer ? (
@@ -1467,97 +1603,292 @@ export function App() {
             </>
           )}
 
-          {/* Remote Server File Explorer View */}
+          {/* Remote Server File Explorer + Parallel HTTP 206 Range Downloader View */}
           {activeNav === 'remote-files' && (
-            <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-              <div className="h-[36px] shrink-0 px-4 border-b border-[#1E2230] flex items-center justify-between bg-[#0A0B0E]">
-                <div className="flex items-center gap-2 text-[12px] font-medium text-[#ECEEF2]">
-                  <Server className="w-3.5 h-3.5 text-[#3B82F6]" strokeWidth={1.5} />
-                  <span>Linux Sunucu Dosya Gezgini</span>
-                  <span className="text-[11px] font-mono text-[#636875]">
-                    (/srv{targetFolder})
-                  </span>
+            <>
+              <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+                <div className="h-[36px] shrink-0 px-4 border-b border-[#1E2230] flex items-center justify-between bg-[#0A0B0E]">
+                  <div className="flex items-center gap-2 text-[12px] font-medium text-[#ECEEF2]">
+                    <Server className="w-3.5 h-3.5 text-[#3B82F6]" strokeWidth={1.5} />
+                    <span>Linux Sunucu Dosya Gezgini & Çok Kanallı Range İndirici</span>
+                    <span className="text-[11px] font-mono text-[#636875]">
+                      (/srv{targetFolder} • {downloadConcurrency}x Paralel HTTP 206 Kanalı)
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-1.5 text-[11px] text-[#9499A6]">
+                      <span>Paralel Kanal:</span>
+                      {[4, 6, 8, 16].map((n) => (
+                        <button
+                          key={n}
+                          onClick={() => setDownloadConcurrency(n)}
+                          className={`h-[22px] px-2 rounded font-mono text-[10px] border cursor-pointer ${
+                            downloadConcurrency === n
+                              ? 'bg-[#192338] border-[#3B82F6] text-[#ECEEF2]'
+                              : 'bg-[#161922] border-[#2A2F40] text-[#9499A6]'
+                          }`}
+                        >
+                          {n}x
+                        </button>
+                      ))}
+                    </div>
+                    <button
+                      onClick={fetchRemoteFiles}
+                      className="h-[24px] px-2.5 rounded bg-[#161922] hover:bg-[#1C202B] border border-[#2A2F40] text-[11px] text-[#ECEEF2] flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <RefreshCw className="w-3 h-3 text-[#3B82F6]" strokeWidth={1.5} />
+                      <span>Listeyi Yenile</span>
+                    </button>
+                  </div>
                 </div>
-                <button
-                  onClick={fetchRemoteFiles}
-                  className="h-[24px] px-2.5 rounded bg-[#161922] hover:bg-[#1C202B] border border-[#2A2F40] text-[11px] text-[#ECEEF2] flex items-center gap-1.5 cursor-pointer"
-                >
-                  <RefreshCw className="w-3 h-3 text-[#3B82F6]" strokeWidth={1.5} />
-                  <span>Listeyi Yenile</span>
-                </button>
+
+                {/* Server Files Table */}
+                <div className="flex-1 overflow-auto">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="h-[30px] bg-[#0F1117] border-b border-[#1E2230] text-[11px] font-medium text-[#636875] uppercase">
+                        <th className="pl-4 pr-2">Sunucu Dosya Adı</th>
+                        <th className="px-2">Tam Yol</th>
+                        <th className="px-2 text-right">Boyut</th>
+                        <th className="px-2">Sunucu SHA-512 Özeti (?checksum=sha512)</th>
+                        <th className="px-2">Değiştirilme</th>
+                        <th className="pl-2 pr-4 text-right">Paralel Range İndirme & İşlem</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#161821] text-[12px]">
+                      {remoteFiles.map((file) => (
+                        <tr
+                          key={file.path}
+                          className="h-[42px] hover:bg-[#1C202B] transition-colors"
+                        >
+                          <td className="pl-4 pr-2 font-medium text-[#ECEEF2] flex items-center gap-2 h-[42px]">
+                            <FileText className="w-3.5 h-3.5 text-[#3B82F6]" strokeWidth={1.5} />
+                            <span>{file.name}</span>
+                          </td>
+                          <td className="px-2 font-mono text-[11px] text-[#9499A6]">
+                            {file.path}
+                          </td>
+                          <td className="px-2 text-right font-mono text-[11px] tabular-nums text-[#ECEEF2]">
+                            {formatBytes(file.size)}
+                          </td>
+                          <td className="px-2 font-mono text-[11px] text-[#9499A6]">
+                            {file.sha512 ? (
+                              <span className="text-emerald-400" title={file.sha512}>
+                                {file.sha512.slice(0, 26)}…
+                              </span>
+                            ) : (
+                              <span className="text-[#636875]">Sorgulanmadı</span>
+                            )}
+                          </td>
+                          <td className="px-2 font-mono text-[11px] text-[#636875]">
+                            {file.modified}
+                          </td>
+                          <td className="pl-2 pr-4 text-right">
+                            <div className="inline-flex items-center gap-1.5">
+                              <button
+                                onClick={() => startParallelRangeDownload(file, false)}
+                                className="h-[26px] px-2.5 rounded bg-[#3B82F6] hover:bg-[#2563EB] text-white text-[11px] font-medium flex items-center gap-1.5 cursor-pointer"
+                                title={`Dosyayı ${downloadConcurrency} eşzamanlı HTTP 206 Range kanalıyla indir ve SHA-512 doğrula`}
+                              >
+                                <Download className="w-3 h-3" strokeWidth={1.75} />
+                                <span>Paralel İndir ({downloadConcurrency}x)</span>
+                              </button>
+                              <button
+                                onClick={() => handleVerifyRemoteFileSha512(file)}
+                                className="h-[26px] px-2 rounded bg-[#161922] hover:bg-[#1C202B] border border-[#2A2F40] text-[11px] text-[#ECEEF2] flex items-center gap-1 cursor-pointer"
+                                title="Sunucudan ?checksum=sha512 hesaplat"
+                              >
+                                <ShieldCheck
+                                  className="w-3 h-3 text-[#3B82F6]"
+                                  strokeWidth={1.5}
+                                />
+                                <span>SHA-512</span>
+                              </button>
+                              <button
+                                onClick={() => handleDeleteRemoteFile(file)}
+                                className="h-[26px] w-[26px] rounded bg-[#161922] hover:bg-[#1C202B] border border-[#2A2F40] text-[#9499A6] hover:text-rose-400 flex items-center justify-center cursor-pointer"
+                                title="Sunucudan Sil (after_delete .audit.log kancasını tetikler)"
+                              >
+                                <Trash2 className="w-3 h-3" strokeWidth={1.5} />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
 
-              <div className="flex-1 overflow-auto">
-                <table className="w-full text-left border-collapse">
-                  <thead>
-                    <tr className="h-[30px] bg-[#0F1117] border-b border-[#1E2230] text-[11px] font-medium text-[#636875] uppercase">
-                      <th className="pl-4 pr-2">Sunucu Dosya Adı</th>
-                      <th className="px-2">Tam Yol</th>
-                      <th className="px-2 text-right">Boyut</th>
-                      <th className="px-2">Sunucu SHA-512 Özeti (?checksum=sha512)</th>
-                      <th className="px-2">Değiştirilme</th>
-                      <th className="pl-2 pr-4 text-right">İşlem</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-[#161821] text-[12px]">
-                    {remoteFiles.map((file) => (
-                      <tr key={file.path} className="h-[40px] hover:bg-[#1C202B] transition-colors">
-                        <td className="pl-4 pr-2 font-medium text-[#ECEEF2] flex items-center gap-2 h-[40px]">
-                          <FileText className="w-3.5 h-3.5 text-[#3B82F6]" strokeWidth={1.5} />
-                          <span>{file.name}</span>
-                        </td>
-                        <td className="px-2 font-mono text-[11px] text-[#9499A6]">{file.path}</td>
-                        <td className="px-2 text-right font-mono text-[11px] tabular-nums text-[#ECEEF2]">
-                          {formatBytes(file.size)}
-                        </td>
-                        <td className="px-2 font-mono text-[11px] text-[#9499A6]">
-                          {file.sha512 ? (
-                            <span className="text-emerald-400" title={file.sha512}>
-                              {file.sha512.slice(0, 28)}…
-                            </span>
-                          ) : (
-                            <span className="text-[#636875]">Sorgulanmadı</span>
-                          )}
-                        </td>
-                        <td className="px-2 font-mono text-[11px] text-[#636875]">
-                          {file.modified}
-                        </td>
-                        <td className="pl-2 pr-4 text-right">
-                          <div className="inline-flex items-center gap-1.5">
-                            <button
-                              onClick={() => handleVerifyRemoteFileSha512(file)}
-                              className="h-[24px] px-2 rounded bg-[#161922] hover:bg-[#1C202B] border border-[#2A2F40] text-[11px] text-[#ECEEF2] flex items-center gap-1 cursor-pointer"
-                              title="Sunucudan ?checksum=sha512 hesaplat"
+              {/* Bottom Parallel HTTP 206 Range Downloads & Live Multi-Channel Chunk Matrix */}
+              <section className="h-[275px] shrink-0 bg-[#0F1117] border-t border-[#1E2230] flex flex-col">
+                <div className="h-[34px] px-4 border-b border-[#1E2230] flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-[12px] font-medium text-[#ECEEF2]">
+                    <Layers className="w-3.5 h-3.5 text-[#3B82F6]" strokeWidth={1.5} />
+                    <span>
+                      Çok Kanallı Paralel HTTP 206 Range İndirmeleri & Canlı Kanal Haritası
+                    </span>
+                  </div>
+                  {selectedDownload && (
+                    <div className="text-[11px] font-mono text-[#9499A6] tabular-nums">
+                      Aktif Kanal: {selectedDownload.activeWorkers}/
+                      {selectedDownload.concurrency} • Tamamlanan Parça:{' '}
+                      {selectedDownload.completedChunksCount}/{selectedDownload.totalChunks}
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex-1 overflow-auto p-3.5">
+                  {downloadList.length === 0 ? (
+                    <div className="h-full flex items-center justify-center text-[12px] text-[#636875]">
+                      Yukarıdaki sunucu listesinden herhangi bir dosyanın yanındaki &quot;Paralel İndir ({downloadConcurrency}x)&quot; butonuna tıklayarak çok kanallı Range indirmesini ve canlı parça matrisini başlatın.
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-12 gap-4">
+                      {/* Left 6 cols: Active Parallel Range Downloads List */}
+                      <div className="col-span-6 space-y-2 max-h-[210px] overflow-y-auto pr-1">
+                        {downloadList.map((dl) => {
+                          const isSel = selectedDownload?.id === dl.id;
+                          return (
+                            <div
+                              key={dl.id}
+                              onClick={() => setSelectedDownloadId(dl.id)}
+                              className={`p-2.5 rounded border transition-colors cursor-pointer ${
+                                isSel
+                                  ? 'bg-[#192338] border-[#3B82F6]/60'
+                                  : 'bg-[#161922] border-[#1E2230] hover:border-[#2A2F40]'
+                              }`}
                             >
-                              <ShieldCheck className="w-3 h-3 text-[#3B82F6]" strokeWidth={1.5} />
-                              <span>SHA-512 Doğrula</span>
-                            </button>
-                            {!simulationMode && (
-                              <a
-                                href={`${serverUrl.replace(/\/+$/, '')}/api/raw${file.path}?auth=${jwtToken}`}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="h-[24px] px-2 rounded bg-[#161922] hover:bg-[#1C202B] border border-[#2A2F40] text-[11px] text-[#ECEEF2] flex items-center gap-1"
-                              >
-                                <Download className="w-3 h-3" strokeWidth={1.5} />
-                                <span>İndir</span>
-                              </a>
-                            )}
-                            <button
-                              onClick={() => handleDeleteRemoteFile(file)}
-                              className="h-[24px] w-[24px] rounded bg-[#161922] hover:bg-[#1C202B] border border-[#2A2F40] text-[#9499A6] hover:text-rose-400 flex items-center justify-center cursor-pointer"
-                              title="Sunucudan Sil (after_delete .audit.log kancasını tetikler)"
-                            >
-                              <Trash2 className="w-3 h-3" strokeWidth={1.5} />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+                              <div className="flex items-center justify-between gap-2 mb-1">
+                                <span className="text-[12px] font-medium text-[#ECEEF2] truncate">
+                                  {dl.fileName}
+                                </span>
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  {dl.status === 'downloading' && (
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handlePauseDownload(dl.id);
+                                      }}
+                                      className="h-[22px] px-2 rounded bg-[#0F1117] hover:bg-[#1C202B] border border-[#2A2F40] text-[10px] text-[#ECEEF2] flex items-center gap-1 cursor-pointer"
+                                    >
+                                      <Pause className="w-2.5 h-2.5" strokeWidth={1.75} />
+                                      <span>Durdur</span>
+                                    </button>
+                                  )}
+                                  {dl.status === 'paused' && (
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleResumeDownload(dl.id);
+                                      }}
+                                      className="h-[22px] px-2 rounded bg-[#3B82F6] hover:bg-[#2563EB] text-[10px] text-white flex items-center gap-1 cursor-pointer"
+                                    >
+                                      <Play className="w-2.5 h-2.5" strokeWidth={1.75} />
+                                      <span>Devam Et</span>
+                                    </button>
+                                  )}
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleRemoveDownload(dl.id);
+                                    }}
+                                    className="h-[22px] w-[22px] rounded bg-[#0F1117] border border-[#2A2F40] text-[#9499A6] hover:text-rose-400 flex items-center justify-center cursor-pointer"
+                                  >
+                                    <Trash2 className="w-3 h-3" strokeWidth={1.5} />
+                                  </button>
+                                </div>
+                              </div>
+
+                              <div className="flex items-center justify-between text-[11px] font-mono text-[#9499A6] tabular-nums mb-1">
+                                <span>
+                                  %{dl.percent.toFixed(1)} ({formatBytes(dl.downloadedBytes)} /{' '}
+                                  {formatBytes(dl.totalSize)})
+                                </span>
+                                <span>
+                                  {dl.status === 'downloading'
+                                    ? `${formatBytes(dl.speedBytesPerSec)}/sn • ${dl.activeWorkers}x Kanal`
+                                    : dl.status === 'completed'
+                                    ? 'SHA-512 Doğrulandı'
+                                    : 'Duraklatıldı'}
+                                </span>
+                              </div>
+
+                              <div className="w-full h-1.5 bg-[#0F1117] rounded-full overflow-hidden">
+                                <div
+                                  className={`h-full transition-all duration-150 ${
+                                    dl.status === 'completed'
+                                      ? 'bg-emerald-500'
+                                      : dl.status === 'paused'
+                                      ? 'bg-amber-500'
+                                      : 'bg-[#3B82F6]'
+                                  }`}
+                                  style={{ width: `${Math.min(100, dl.percent)}%` }}
+                                />
+                              </div>
+
+                              {dl.verified && dl.clientSha512 && (
+                                <div className="mt-1.5 text-[10px] font-mono text-emerald-400 truncate">
+                                  SHA-512 Eşleşti: {dl.clientSha512.slice(0, 44)}…
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      {/* Right 6 cols: Live Parallel Range Worker Chunk Matrix */}
+                      <div className="col-span-6 space-y-2">
+                        {selectedDownload && (
+                          <>
+                            <div className="flex items-center justify-between text-[11px]">
+                              <div className="flex items-center gap-3">
+                                <span className="flex items-center gap-1.5 text-[#9499A6]">
+                                  <span className="w-2.5 h-2.5 rounded-xs bg-[#3B82F6] inline-block" />
+                                  <span>
+                                    Eşzamanlı İndirilen ({selectedDownload.activeWorkers}x Kanal)
+                                  </span>
+                                </span>
+                                <span className="flex items-center gap-1.5 text-[#9499A6]">
+                                  <span className="w-2.5 h-2.5 rounded-xs bg-emerald-500 inline-block" />
+                                  <span>
+                                    Tamamlanan ({selectedDownload.completedChunksCount})
+                                  </span>
+                                </span>
+                                <span className="flex items-center gap-1.5 text-[#9499A6]">
+                                  <span className="w-2.5 h-2.5 rounded-xs bg-amber-500 inline-block" />
+                                  <span>Duraklatılan</span>
+                                </span>
+                              </div>
+                            </div>
+
+                            <div className="grid grid-cols-12 gap-1.5 p-2.5 rounded bg-[#161922]/60 border border-[#1E2230] max-h-[165px] overflow-y-auto">
+                              {selectedDownload.chunkStates.map((st, idx) => (
+                                <div
+                                  key={idx}
+                                  title={`Range Parçası #${idx + 1}: bytes=${idx * chunkSizeMb}M-${(idx + 1) * chunkSizeMb}M (${st})`}
+                                  className={`h-[24px] rounded-xs font-mono text-[10px] flex items-center justify-center tabular-nums transition-colors ${
+                                    st === 'completed'
+                                      ? 'bg-emerald-500/20 border border-emerald-500/60 text-emerald-300'
+                                      : st === 'downloading'
+                                      ? 'bg-[#3B82F6] text-white font-semibold animate-pulse'
+                                      : st === 'paused'
+                                      ? 'bg-amber-500/30 border border-amber-500 text-amber-300'
+                                      : 'bg-[#161922] border border-[#1E2230] text-[#636875]'
+                                  }`}
+                                >
+                                  #{idx + 1}
+                                </div>
+                              ))}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </section>
+            </>
           )}
 
           {/* Linux Server Setup Tab */}
@@ -1630,10 +1961,10 @@ export function App() {
             <div className="flex-1 overflow-y-auto p-6 max-w-2xl space-y-5">
               <div className="border-b border-[#1E2230] pb-3">
                 <h1 className="text-[15px] font-semibold text-[#ECEEF2]">
-                  TUS Parçalı Aktarım ve SHA-512 Doğrulama Ayarları
+                  TUS Parçalı Yükleme, Paralel Range İndirme ve SHA-512 Ayarları
                 </h1>
                 <p className="text-[12px] text-[#9499A6] mt-0.5">
-                  Linux FileBrowser sunucunuzun adresini, parça boyutunu ve doğrulama katmanlarını yapılandırın.
+                  Linux FileBrowser sunucunuzun adresini, parça boyutunu ve paralel HTTP 206 Range kanal sayısını yapılandırın.
                 </p>
               </div>
 
@@ -1650,7 +1981,7 @@ export function App() {
                   />
                 </div>
 
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-3 gap-3">
                   <div>
                     <label className="block text-[#9499A6] mb-1">Sunucu Hedef Klasörü</label>
                     <input
@@ -1661,13 +1992,30 @@ export function App() {
                     />
                   </div>
                   <div>
-                    <label className="block text-[#9499A6] mb-1">TUS Parça Boyutu (MB)</label>
+                    <label className="block text-[#9499A6] mb-1">Parça Boyutu (MB)</label>
                     <input
                       type="number"
                       min={1}
                       max={100}
                       value={chunkSizeMb}
                       onChange={(e) => setChunkSizeMb(Number(e.target.value) || 10)}
+                      className="w-full h-[32px] px-3 rounded bg-[#161922] border border-[#2A2F40] font-mono text-[#ECEEF2]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[#9499A6] mb-1">
+                      Paralel Range Kanalı (1-16)
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={16}
+                      value={downloadConcurrency}
+                      onChange={(e) =>
+                        setDownloadConcurrency(
+                          Math.min(16, Math.max(1, Number(e.target.value) || 6))
+                        )
+                      }
                       className="w-full h-[32px] px-3 rounded bg-[#161922] border border-[#2A2F40] font-mono text-[#ECEEF2]"
                     />
                   </div>
@@ -1689,10 +2037,10 @@ export function App() {
                 <div className="p-3 rounded bg-[#0F1117] border border-[#1E2230] flex items-center justify-between">
                   <div>
                     <div className="font-medium text-[#ECEEF2]">
-                      Yükleme Sonunda Sunucudan Tam Dosya SHA-512 Sorgula (?checksum=sha512)
+                      Aktarım Sonunda Sunucudan Tam Dosya SHA-512 Sorgula (?checksum=sha512)
                     </div>
                     <div className="text-[11px] text-[#636875] mt-0.5">
-                      Kapalı olsa bile her {chunkSizeMb} MB parça TUS Upload-Checksum: sha512 başlığıyla RAM'de anında doğrulanır.
+                      Hem TUS yüklemelerinde hem de Paralel HTTP 206 Range indirmelerinde sunucu SHA-512 özetiyle karşılaştırır.
                     </div>
                   </div>
                   <input
@@ -1714,21 +2062,23 @@ export function App() {
           <span className="flex items-center gap-1.5">
             <span
               className={`w-2 h-2 rounded-full ${
-                activeUploadsCount > 0 ? 'bg-[#3B82F6] animate-pulse' : 'bg-emerald-500'
+                activeUploadsCount + activeDownloadsCount > 0
+                  ? 'bg-[#3B82F6] animate-pulse'
+                  : 'bg-emerald-500'
               }`}
             />
             <span className="text-[#9499A6]">
-              {activeUploadsCount > 0
-                ? `${activeUploadsCount} Aktif TUS Akışı (${formatBytes(totalSpeedBytesPerSec)}/sn)`
-                : 'TUS v1.0.0 Hazır'}
+              {activeUploadsCount + activeDownloadsCount > 0
+                ? `${activeUploadsCount} Upload / ${activeDownloadsCount} Range Download (${formatBytes(totalSpeedBytesPerSec)}/sn)`
+                : `TUS v1.0.0 & HTTP 206 Range (${downloadConcurrency}x) Hazır`}
             </span>
           </span>
           <span>Algoritma: SHA-512 (64-bit WASM)</span>
-          <span>Parmak İzi: 3ms Örneklem (İlk/Orta/Son 1 MB)</span>
+          <span>Parmak İzi: 3ms Örneklem</span>
         </div>
 
         <div className="flex items-center gap-4">
-          <span>Boşluk: Seçili Aktarımı Duraklat/Devam Et</span>
+          <span>Boşluk: Duraklat/Devam Et</span>
           <span>Ctrl+K: Komut Paleti</span>
         </div>
       </footer>
